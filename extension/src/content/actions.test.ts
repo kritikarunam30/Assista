@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ActionReply, ToolRequest } from '../shared/messages';
 import type { PageSnapshot } from '../shared/snapshot';
 import { runAction } from './actions';
+import { setSavedDetails } from './saved';
 import { buildSnapshot } from './snapshot';
 
 let snapshot: PageSnapshot;
@@ -145,6 +146,48 @@ describe('click: confirmation gate', () => {
   });
 });
 
+describe('click: actions nobody asked for', () => {
+  function click(name: string, heard: string[], args: Record<string, unknown> = {}) {
+    const tool: ToolRequest = {
+      name: 'click',
+      snapshotId: snapshot.snapshot_id,
+      ref: refOf(name),
+      args,
+      heard,
+    };
+    return runAction(tool, document, (work) => work());
+  }
+
+  it('holds a press the user did not ask for, and does nothing', () => {
+    page('<button id="b" type="button">Subscribe</button>');
+    const clicked = vi.fn();
+    document.getElementById('b')!.addEventListener('click', clicked);
+    expect(click('Subscribe', ['scroll down'])).toEqual({
+      ok: false,
+      error: 'held_by_gate',
+      held: { control: 'Subscribe', reason: 'not_requested' },
+    });
+    expect(clicked).not.toHaveBeenCalled();
+  });
+
+  it('runs a press the user asked for', () => {
+    page('<button id="b" type="button">Subscribe</button>');
+    expect(click('Subscribe', ['press the subscribe button'])).toMatchObject({ ok: true });
+  });
+
+  it('takes what was heard from the panel, never from the tool arguments', () => {
+    page('<button id="b" type="button">Subscribe</button>');
+    const clicked = vi.fn();
+    document.getElementById('b')!.addEventListener('click', clicked);
+    const smuggled = { heard: ['press subscribe'], confirmed: { control: 'Subscribe' } };
+    expect(click('Subscribe', ['what is this page?'], smuggled)).toMatchObject({
+      ok: false,
+      error: 'held_by_gate',
+    });
+    expect(clicked).not.toHaveBeenCalled();
+  });
+});
+
 describe('type', () => {
   it('fills a field and fires the events a typing user would', () => {
     page('<label>Full name <input id="n"></label>');
@@ -158,6 +201,7 @@ describe('type', () => {
         action: 'type',
         target: { role: 'textbox', name: 'Full name' },
         detail: 'Asha Rao',
+        kind: 'name',
       },
     });
     expect(field.value).toBe('Asha Rao');
@@ -195,6 +239,49 @@ describe('type', () => {
     expect(run('type', 'Go', { text: 'x' })).toEqual({ ok: false, error: 'not_a_text_field' });
     expect(run('type', 'Code', { text: 'y' })).toEqual({ ok: false, error: 'disabled' });
     expect(run('type', 'Name')).toEqual({ ok: false, error: 'missing_text' });
+  });
+});
+
+describe('type: saved details', () => {
+  afterEach(() => setSavedDetails({}));
+
+  it('fills a field from the saved details when asked to', () => {
+    setSavedDetails({ phone: '98450 12345' });
+    page('<label>Mobile number <input id="p" type="tel"></label>');
+    expect(run('type', 'Mobile number', { use_saved: true })).toEqual({
+      ok: true,
+      result: {
+        action: 'type',
+        target: { role: 'textbox', name: 'Mobile number' },
+        detail: '98450 12345',
+        kind: 'phone',
+        fromSaved: true,
+      },
+    });
+    expect((document.getElementById('p') as HTMLInputElement).value).toBe('98450 12345');
+  });
+
+  it('says so when nothing fits the field', () => {
+    setSavedDetails({ phone: '98450 12345' });
+    page('<label>City <input></label>');
+    expect(run('type', 'City', { use_saved: true })).toEqual({ ok: false, error: 'nothing_saved' });
+  });
+
+  it('never fills a sensitive field from the saved details', () => {
+    setSavedDetails({ name: 'Asha Rao', phone: '98450 12345' });
+    page('<label>Phone PIN <input id="f"></label>');
+    expect(run('type', 'Phone PIN', { use_saved: true })).toEqual({
+      ok: false,
+      error: 'nothing_saved',
+    });
+    expect((document.getElementById('f') as HTMLInputElement).value).toBe('');
+  });
+
+  it('reports no kind for a field that is not a personal detail', () => {
+    page('<label>Special requests <input></label>');
+    const reply = run('type', 'Special requests', { text: 'A quiet table' });
+    expect(reply).toMatchObject({ ok: true });
+    expect(reply.ok && reply.result.kind).toBeUndefined();
   });
 });
 
@@ -255,6 +342,34 @@ describe('scroll and back', () => {
     const back = vi.spyOn(window.history, 'back').mockImplementation(() => undefined);
     expect(run('go_back')).toEqual({ ok: true, result: { action: 'go_back' } });
     expect(back).toHaveBeenCalledOnce();
+  });
+});
+
+describe('focus', () => {
+  it('moves focus to a field without typing or pressing anything', () => {
+    page('<label>Search <input id="q" type="search"></label>');
+    expect(run('focus', 'Search')).toEqual({
+      ok: true,
+      result: { action: 'focus', target: { role: 'searchbox', name: 'Search' } },
+    });
+    expect(document.activeElement?.id).toBe('q');
+    expect((document.getElementById('q') as HTMLInputElement).value).toBe('');
+  });
+
+  it('can move focus to a heading', () => {
+    page('<h2 id="h">Reviews</h2>');
+    expect(run('focus', 'Reviews')).toMatchObject({ ok: true });
+    expect(document.activeElement?.id).toBe('h');
+  });
+
+  it('hands a private field to the user', () => {
+    page('<label>Password <input id="p" type="password"></label>');
+    expect(run('focus', 'Password')).toEqual({
+      ok: false,
+      error: 'sensitive_field',
+      sensitive: { field: 'Password' },
+    });
+    expect(document.activeElement?.id).toBe('p');
   });
 });
 

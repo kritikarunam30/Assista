@@ -80,6 +80,33 @@ PHRASES: dict[str, tuple[str, ...]] = {
         "read the action log",
         "action log",
     ),
+    "forget": (
+        "forget my details",
+        "forget my saved details",
+        "forget saved details",
+        "clear my details",
+        "clear my saved details",
+        "delete my details",
+        "delete my saved details",
+        "forget what you saved",
+    ),
+    "private_on": (
+        "private mode",
+        "private mode on",
+        "turn on private mode",
+        "turn private mode on",
+        "switch on private mode",
+        "start private mode",
+        "go private",
+    ),
+    "private_off": (
+        "private mode off",
+        "turn off private mode",
+        "turn private mode off",
+        "switch off private mode",
+        "stop private mode",
+        "leave private mode",
+    ),
 }
 _ALL = {phrase for phrases in PHRASES.values() for phrase in phrases}
 

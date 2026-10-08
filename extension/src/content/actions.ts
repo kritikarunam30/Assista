@@ -4,6 +4,7 @@
 import { gateCheck } from '../safety/gate';
 import { isSensitiveField } from '../safety/redaction';
 import type { ActionDone, ActionReply, ToolRequest } from '../shared/messages';
+import { kindOf, savedValueFor } from './saved';
 import { StaleRefError, describeElement, resolveRef } from './snapshot';
 
 /** Runs something after the reply has been sent; a click can unload the page. */
@@ -35,9 +36,11 @@ export function runAction(
       case 'click':
         return click(target(tool), tool, defer);
       case 'type':
-        return type(target(tool), tool.args.text);
+        return type(target(tool), tool.args.text, tool.args.use_saved === true);
       case 'select':
         return select(target(tool), tool.args.option);
+      case 'focus':
+        return focus(target(tool));
       case 'scroll':
         return scroll(tool, doc);
       case 'go_back':
@@ -72,7 +75,7 @@ function click(el: Element, tool: ToolRequest, defer: Defer): ActionReply {
   if (isTextField(el) && isSensitiveField(el, described.name)) {
     return focusPrivately(el, described.name);
   }
-  const hold = gateCheck(el, described.name);
+  const hold = gateCheck(el, described.name, tool.heard);
   if (hold) {
     if (!tool.confirmed) return { ok: false, error: 'held_by_gate', held: hold };
     // The user agreed to what was read back. If the control now reads differently, the
@@ -84,9 +87,14 @@ function click(el: Element, tool: ToolRequest, defer: Defer): ActionReply {
   return done({ action: 'click', target: described });
 }
 
-function type(el: Element, text: unknown): ActionReply {
-  if (typeof text !== 'string') return failed('missing_text');
+function type(el: Element, text: unknown, useSaved: boolean): ActionReply {
   const described = describeElement(el);
+  if (useSaved) {
+    // The value comes from the device's own store; the model never sees it beforehand.
+    text = isTextField(el) ? savedValueFor(el, described.name) : null;
+    if (typeof text !== 'string') return failed('nothing_saved');
+  }
+  if (typeof text !== 'string') return failed('missing_text');
   if (!isTextField(el)) return failed('not_a_text_field');
   if (isDisabled(el) || (el as HTMLInputElement).readOnly === true) return failed('disabled');
   // Secrets are typed by the user, never by the assistant: nothing spoken or sent to a
@@ -94,7 +102,11 @@ function type(el: Element, text: unknown): ActionReply {
   if (isSensitiveField(el, described.name)) return focusPrivately(el, described.name);
   reveal(el);
   setValue(el, text);
-  return done({ action: 'type', target: described, detail: text });
+  const typed: ActionDone = { action: 'type', target: described, detail: text };
+  const kind = kindOf(el, described.name);
+  if (kind) typed.kind = kind;
+  if (useSaved) typed.fromSaved = true;
+  return done(typed);
 }
 
 function select(el: Element, option: unknown): ActionReply {
@@ -148,6 +160,20 @@ function scroll(tool: ToolRequest, doc: Document): ActionReply {
   if (view.scrollY + view.innerHeight >= height - 2) detail = 'bottom of the page';
   else if (view.scrollY <= 0) detail = 'top of the page';
   return done({ action: 'scroll', detail });
+}
+
+/** Moves keyboard focus to an element without pressing or typing anything. */
+function focus(el: Element): ActionReply {
+  const described = describeElement(el);
+  if (isTextField(el) && isSensitiveField(el, described.name)) {
+    return focusPrivately(el, described.name);
+  }
+  // Headings and plain text take focus only once they have a tabindex.
+  if ((el as HTMLElement).tabIndex < 0 && !el.hasAttribute('tabindex')) {
+    el.setAttribute('tabindex', '-1');
+  }
+  reveal(el);
+  return done({ action: 'focus', target: described });
 }
 
 /** Moves focus to a sensitive field and reports that the user must type it. */

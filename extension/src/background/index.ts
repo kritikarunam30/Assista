@@ -16,7 +16,9 @@ import {
 } from '../shared/messages';
 import { fetchDocument, isLocalFile, isPdfUrl, pdfSnapshot, servesPdf } from './documents';
 import { cropImage } from './screenshot';
+import { wasRequested } from '../safety/gate';
 import { findTab, normalizeUrl, pickTargetTab } from './tabs';
+import { WATCH_ALARM, WATCH_TOOLS, createWatchEngine } from './watches';
 
 const EXTENSION_ORIGIN = chrome.runtime.getURL('');
 const CONTENT_SCRIPT = 'content.js';
@@ -27,6 +29,12 @@ chrome.sidePanel
 
 chrome.runtime.onInstalled.addListener(() => {
   void injectIntoOpenTabs();
+  void watches.ensureAlarm();
+});
+chrome.runtime.onStartup.addListener(() => void watches.ensureAlarm());
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === WATCH_ALARM) void watches.onAlarm();
 });
 
 chrome.runtime.onMessage.addListener((msg: unknown, sender, sendResponse) => {
@@ -77,6 +85,12 @@ async function handle(
       return documentOfTargetTab();
     case 'run_tool':
       return runTool(msg.tool);
+    case 'watch_value':
+      await watches.onValue(msg.id, msg.value);
+      return { ok: true };
+    case 'countdown':
+      await watches.announce(countdownWarning(msg.seconds, sender.tab?.title));
+      return { ok: true };
   }
 }
 
@@ -118,6 +132,16 @@ async function sendToContent<R>(tabId: number, msg: ToContent): Promise<R | null
     return null;
   }
 }
+
+/** What the user hears when a session timer on a page is about to run out (F17). */
+function countdownWarning(seconds: number, title?: string): string {
+  const where = title ? ` on ${title}` : '';
+  return seconds > 60
+    ? `Heads up: the timer${where} has about ${Math.round(seconds / 60)} minutes left.`
+    : `The timer${where} has ${seconds} seconds left.`;
+}
+
+const watches = createWatchEngine({ targetTab, sendToContent, sendToPanel });
 
 async function snapshotOfTargetTab(): Promise<SnapshotReply> {
   const tab = await targetTab();
@@ -180,8 +204,10 @@ async function screenshotOfTargetTab(ref?: string): Promise<ScreenshotReply> {
  * that follows shows the result.
  */
 async function runTool(tool: ToolRequest): Promise<ActionReply> {
+  if (WATCH_TOOLS.has(tool.name)) return watches.runTool(tool);
   if (tool.name === 'switch_tab') return switchTab(tool.args);
-  if (tool.name === 'open_url') return openUrl(tool.args);
+  if (tool.name === 'open_url') return openUrl(tool);
+  if (tool.name === 'web_search') return webSearch(tool);
 
   const tab = await targetTab();
   if (tab?.id === undefined) return { ok: false, error: 'no_tab' };
@@ -213,9 +239,25 @@ async function switchTab(args: Record<string, unknown>): Promise<ActionReply> {
   };
 }
 
-async function openUrl(args: Record<string, unknown>): Promise<ActionReply> {
+/**
+ * Holds an action the user did not ask for by name (F21): `what` is the words that
+ * should have been heard, `control` what is read back. A confirmed action goes ahead.
+ */
+function unrequested(tool: ToolRequest, what: string, control: string): ActionReply | null {
+  if (!tool.heard || wasRequested(what, tool.heard)) return null;
+  if (tool.confirmed?.control === control) return null;
+  return { ok: false, error: 'held_by_gate', held: { control, reason: 'not_requested' } };
+}
+
+async function openUrl(tool: ToolRequest, checked = false): Promise<ActionReply> {
+  const args = tool.args;
   const url = normalizeUrl(args.url);
   if (!url) return { ok: false, error: 'blocked_url' };
+  const host = new URL(url).hostname.replace(/^www\./, '');
+  // The site's own name must have been said: "open example.com" names example.
+  const siteName = host.split('.').slice(0, -1).join(' ') || host;
+  const hold = checked ? null : unrequested(tool, siteName, host);
+  if (hold) return hold;
   const current = args.new_tab === true ? undefined : await targetTab();
   const tab =
     current?.id === undefined
@@ -223,6 +265,18 @@ async function openUrl(args: Record<string, unknown>): Promise<ActionReply> {
       : await chrome.tabs.update(current.id, { url });
   if (tab?.id !== undefined) await settle(tab.id);
   return { ok: true, result: { action: 'open_url', detail: new URL(url).hostname } };
+}
+
+/** Opens a search engine's results for the user's words. */
+async function webSearch(tool: ToolRequest): Promise<ActionReply> {
+  const args = tool.args;
+  const query = typeof args.query === 'string' ? args.query.trim() : '';
+  if (!query) return { ok: false, error: 'missing_text' };
+  const hold = unrequested(tool, query, query);
+  if (hold) return hold;
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  const reply = await openUrl({ ...tool, args: { url, new_tab: args.new_tab } }, true);
+  return reply.ok ? { ok: true, result: { action: 'web_search', detail: query } } : reply;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

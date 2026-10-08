@@ -25,11 +25,13 @@ import {
   type Preferences,
 } from '../store/preferences';
 import { describeActions, entryFor, loadActions, logAction } from '../store/actionLog';
+import { forgetSavedDetails, saveDetail } from '../store/savedDetails';
 import { watchKeySettings } from '../store/settings';
-import { Cues } from './cues';
-import { cancelSay, say } from './localVoice';
+import { Cues, type CueSound } from './cues';
+import { cancelSay, say, sayNext } from './localVoice';
 import { readLocalPdf } from './localFile';
 import { Mic } from './mic';
+import { answerOnDevice, onDeviceState, type OnDeviceState } from './onDevice';
 import { Player } from './player';
 import { ReplyRecorder } from './replies';
 import { BackendSocket } from './socket';
@@ -66,6 +68,14 @@ const socket = new BackendSocket(backendUrl, {
   onAudio: onBackendAudio,
   onState: (open) => {
     statusEl.dataset.connection = open ? 'open' : 'closed';
+    // A turn cut off by a lost connection is said aloud; otherwise it would just go quiet.
+    const waiting = ['listening', 'thinking', 'speaking'].includes(statusEl.dataset.turn ?? '');
+    if (!open && waiting) {
+      activeTurn = listeningTurn = streamingTurn = null;
+      mic.stop();
+      fail('I lost the connection to the Assista server. Please try again in a moment.');
+      return;
+    }
     setStatus(open ? 'Ready.' : 'Not connected to the Assista server.', 'idle');
     if (open) sendSettings();
   },
@@ -91,6 +101,8 @@ let muted = false;
 let recordingAudio = false;
 /** True when the active turn was a local command, which has its own spoken reply. */
 let localTurn = false;
+/** The reply sentence last received, to recognise one that is sent again. */
+let lastSentence: { turn: string; seq: number } | null = null;
 
 /** An action the confirmation gate is holding until the user says yes. */
 interface HeldAction {
@@ -102,6 +114,14 @@ interface HeldAction {
   asked: boolean;
 }
 let held: HeldAction | null = null;
+/** Whether this device has Chrome's built-in model; checked when the panel starts. */
+let onDevice: OnDeviceState = 'unavailable';
+void onDeviceState().then((state) => {
+  onDevice = state;
+});
+/** The user's latest requests, as heard. An action none of them names is held. */
+const heard: string[] = [];
+const HEARD_KEPT = 3;
 
 function setStatus(text: string, turn: TurnState): void {
   statusEl.textContent = text;
@@ -125,6 +145,13 @@ function fail(text: string): void {
   say(text);
 }
 
+/** Tells the user something no turn asked for: a watch firing, a session about to end. */
+function announce(text: string, cue?: CueSound): void {
+  if (cue) void cues.play(cue);
+  log('assistant', text);
+  say(text, preferences.speed);
+}
+
 function beginTurn(): string {
   stopSpeech();
   muted = false;
@@ -146,8 +173,52 @@ function sendSettings(): void {
     type: 'settings',
     turn_id: 'settings',
     verbosity: preferences.verbosity,
-    private_mode: false,
+    private_mode: preferences.privateMode,
   });
+}
+
+/** True when private mode is on and this device can answer by itself. */
+function answersOnDevice(): boolean {
+  return preferences.privateMode && onDevice === 'available';
+}
+
+/**
+ * Private mode with the on-device model: the page is read and the question answered
+ * here, and neither is sent anywhere. `typed` requests have not been logged yet.
+ */
+async function answerPrivately(text: string, typed: boolean): Promise<void> {
+  if (typed) {
+    stopSpeech();
+    log('user', text);
+  }
+  setStatus('Thinking.', 'thinking');
+  cues.startThinking();
+  try {
+    const reply = await chrome.runtime.sendMessage<ToWorker, SnapshotReply>({
+      to: 'worker',
+      kind: 'get_snapshot',
+    });
+    if (!reply.ok) throw new Error(reply.error);
+    const answer = await answerOnDevice(text, reply.snapshot);
+    cues.stopThinking();
+    answerLocally(answer || 'I have no answer for that.');
+  } catch {
+    fail('I could not answer on this device. Say private mode off to use the online model.');
+  }
+}
+
+const PRIVATE_ON_DEVICE =
+  'Private mode is on. I will answer from this device, so the page stays here. I can ' +
+  'only read in private mode, and your voice is still sent for speech recognition.';
+const PRIVATE_ONLINE =
+  'Private mode is on. This device has no built-in model, so I will keep using the ' +
+  'online one, with private fields hidden and without sending pictures of your screen.';
+
+async function setPrivateMode(on: boolean): Promise<void> {
+  preferences = await savePreferences({ privateMode: on });
+  sendSettings();
+  if (!on) answerLocally('Private mode is off.');
+  else answerLocally(onDevice === 'available' ? PRIVATE_ON_DEVICE : PRIVATE_ONLINE);
 }
 
 /** Says something that is not part of a backend reply, at the user's speed. */
@@ -180,6 +251,16 @@ function runLocalCommand(command: LocalCommand): void {
       void loadActions().then(
         (entries) => answerLocally(describeActions(entries)),
         () => answerLocally('I could not read my action log.'),
+      );
+      break;
+    case 'private_on':
+    case 'private_off':
+      void setPrivateMode(command.kind === 'private_on');
+      break;
+    case 'forget':
+      void forgetSavedDetails().then(
+        () => answerLocally('I have forgotten your saved details.'),
+        () => answerLocally('I could not clear your saved details.'),
       );
       break;
     case 'spell': {
@@ -226,6 +307,10 @@ function sendText(text: string): void {
   if (command) {
     log('user', text);
     runLocalCommand(command);
+    return;
+  }
+  if (answersOnDevice()) {
+    void answerPrivately(text, true);
     return;
   }
   const turn = beginTurn();
@@ -323,7 +408,16 @@ function onBackendMessage(msg: ServerMessage): void {
         runLocalCommand(command);
         break;
       }
+      if (answersOnDevice()) {
+        // The words came from the online recogniser; from here on the turn stays on
+        // the device, and whatever else the backend sends for it is ignored.
+        activeTurn = null;
+        void answerPrivately(msg.text, false);
+        break;
+      }
       setStatus('Thinking.', 'thinking');
+      heard.push(msg.text);
+      heard.splice(0, heard.length - HEARD_KEPT);
       // Anything but a local command settles a held action: a clear yes runs it, a clear
       // no or any other request drops it.
       const waiting = held;
@@ -343,15 +437,23 @@ function onBackendMessage(msg: ServerMessage): void {
     case 'request_document':
       void replyWithDocument(msg.turn_id);
       break;
-    case 'speak_text':
+    case 'speak_text': {
       cues.stopThinking();
-      log('assistant', msg.text);
-      replies.sentence(msg.turn_id, msg.text, msg.audio ?? null);
+      // The same sentence sent again without audio: the backend's voice failed on it.
+      const again = lastSentence?.turn === msg.turn_id && lastSentence.seq === msg.seq;
+      lastSentence = { turn: msg.turn_id, seq: msg.seq };
+      if (!again) {
+        log('assistant', msg.text);
+        replies.sentence(msg.turn_id, msg.text, msg.audio ?? null);
+      }
       recordingAudio = Boolean(msg.audio);
       player.startSentence();
       incomingAudio = muted ? null : (msg.audio ?? null);
+      // Every reply is heard: a sentence without audio is spoken by the browser's voice.
+      if (!msg.audio && !muted) sayNext(msg.text, preferences.speed);
       setStatus('Speaking.', 'speaking');
       break;
+    }
     case 'done':
       cues.stopThinking();
       if (!localTurn) void cues.play('done', true);
@@ -462,6 +564,7 @@ async function runToolCall(call: ToolCallMessage): Promise<void> {
     snapshotId: call.snapshot_id,
     ref: call.ref,
     args: call.args ?? {},
+    heard: [...heard],
   };
   held = null;
   const reply = await runTool(tool);
@@ -502,6 +605,10 @@ function sendToolResult(turn: string, callId: string, tool: ToolRequest, reply: 
     void cues.play('link');
   }
   void logAction(entryFor(tool, reply, Date.now(), Boolean(tool.confirmed)));
+  // A personal detail the user just gave is remembered on this device for other forms.
+  if (reply.ok && reply.result.kind && reply.result.detail && !reply.result.fromSaved) {
+    void saveDetail(reply.result.kind, reply.result.detail);
+  }
   // Private mode: focus is now on a field the user must type themselves.
   if (!reply.ok && reply.sensitive) void cues.play('private');
   if (turn !== activeTurn) return;
@@ -549,6 +656,9 @@ chrome.runtime.onMessage.addListener((msg: unknown, _sender, sendResponse) => {
     case 'stop_key':
       stopSpeech();
       break;
+    case 'announce':
+      announce(msg.text, msg.cue);
+      break;
   }
   const ack: Ack = { ok: true };
   sendResponse(ack);
@@ -565,10 +675,11 @@ const holdKey = new HoldKeyMachine(DEFAULT_KEYS, {
 attachHoldKey(window, holdKey);
 watchKeySettings((settings) => holdKey.configure(settings));
 watchPreferences((next) => {
-  const verbosityChanged = next.verbosity !== preferences.verbosity;
+  const changed =
+    next.verbosity !== preferences.verbosity || next.privateMode !== preferences.privateMode;
   preferences = next;
   player.rate = next.speed;
-  if (verbosityChanged) sendSettings();
+  if (changed) sendSettings();
 });
 
 async function askForMicrophoneOnce(): Promise<void> {
